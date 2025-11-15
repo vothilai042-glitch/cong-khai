@@ -1,0 +1,207 @@
+name: "Run Private Code (YouTube)"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: run-private-code
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # 1) Lấy repo riêng tư về thư mục private-src/
+      - name: Checkout private repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_REPOSITORY }}   # ví dụ: org/private-repo
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}             # token có quyền read (nếu push thì cần write)
+          ref: main
+          path: private-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      # 2) Pre-sync: hợp nhất tieudedalay.csv vào mọi vị trí có thể được main.py dùng
+      - name: Pre-sync tieudedalay.csv (normalize locations)
+        run: |
+          set -e
+          # Các khả năng sẵn có:
+          ROOT_WS=./tieudedalay.csv
+          PRIV_ROOT=private-src/tieudedalay.csv
+          PRIV_SRC=private-src/src/tieudedalay.csv
+
+          pick_src=""
+          if   [ -f "$PRIV_SRC"  ]; then pick_src="$PRIV_SRC"
+          elif [ -f "$PRIV_ROOT" ]; then pick_src="$PRIV_ROOT"
+          elif [ -f "$ROOT_WS"   ]; then pick_src="$ROOT_WS"
+          fi
+
+          # Nếu có file ở bất kỳ nơi nào → trải đều cho 3 nơi
+          if [ -n "$pick_src" ]; then
+            echo "[INFO] Seed tieudedalay from: $pick_src"
+            cp "$pick_src" "$ROOT_WS"    || true
+            mkdir -p private-src/src
+            cp "$pick_src" "$PRIV_ROOT"  || true
+            cp "$pick_src" "$PRIV_SRC"   || true
+          else
+            echo "[INFO] No existing tieudedalay.csv found (first run is fine)."
+          fi
+
+      # 3) Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # 4) Gói hệ thống
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libsndfile1 fonts-dejavu-core
+
+      - name: Provision 10GB swap (avoid OOM)
+        run: |
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=60
+          echo "[INFO] Swap on:"
+          swapon --show
+
+
+      # 5) Python deps
+      - name: Install Python deps
+        working-directory: private-src
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.4.*" "torchaudio==2.4.*"
+          pip install "TTS==0.22.0" "transformers==4.44.2" "huggingface_hub<0.34" pillow soundfile numpy requests tqdm underthesea vinorm google-genai
+          pip install "google-api-python-client" "google-auth" "google-auth-oauthlib"
+
+      # 6) Chạy main.py trong repo riêng tư — cần 4 secrets bắt buộc ở repo công khai
+      - name: Run main.py (video + thumb + append tieudedalay.csv)
+        working-directory: private-src
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+
+          # ----- tốc độ & chất lượng -----
+          # BẬT turbo nhanh nhất (soft-sub, không burn):
+          FAST_MODE: "0"              # "1" = soft-sub, "0" = burn phụ đề
+          OUT_FPS: "15"               # 15fps đủ mượt cho slideshow, giảm 50% khối lượng render
+          X264_PRESET: "ultrafast"    # nhanh nhất; nếu muốn đẹp hơn dùng "veryfast" hoặc "faster"
+          FAST_AUDIO: "1"             # hậu kỳ nhẹ (chỉ loudnorm)
+
+          TARGET_AUDIO_SEC: "3600"
+          INIT_TARGET_CHARS: "5000"
+          INIT_TARGET_SEC_HINT: "300"
+
+          # Sáng tạo + chống lặp cho Gemini
+          GEN_TEMP: "1.1"                 # 1.0–1.1: sáng tạo/ổn định
+          GEN_TOP_P: "0.80"
+          NOVEL_MIN_DETAILS: "7"           # mỗi chương 10 chi tiết mới
+          NO_REPEAT_CONTEXT_CHARS: "3000"  # đọc lại 3000 ký tự gần nhất
+          DO_NOT_REPEAT_MAX: "40"          # tối đa 40 câu cấm lặp
+
+          TOP_K: "1"
+          TOP_P: "0.45"
+          R_PEN: "8.0"
+          L_PEN: "1.05"
+          CHUNK_MAX_CHARS: "150"
+          SENTENCE_PAUSE_MS: "50"
+
+          IMG_W: "1280"
+          IMG_H: "720"
+          POLL_IMG_MODEL: "flux-anime"
+          IMG_RATE_SEC: "1.5"
+          IMG_TIMEOUT_SEC: "15"
+
+          YOUTUBE_PRIVACY: public
+          PYTHONUNBUFFERED: "1"
+
+          # XTTS & threading
+          TORCH_NUM_THREADS: "2"
+          OMP_NUM_THREADS: "2"
+          MKL_NUM_THREADS: "2"
+          OPENBLAS_NUM_THREADS: "2"
+          NUMEXPR_NUM_THREADS: "2"
+
+          # 👇 THÊM 2 DÒNG NÀY
+          GENAI_MAX_RETRIES: "9"
+          GENAI_BACKOFF_BASE: "2.0"
+        
+        run: |
+          set -Eeuo pipefail
+          if [ -f "src/main.py" ]; then
+            echo "[RUN] python src/main.py"
+            python src/main.py
+          else
+            echo "[RUN] python main.py"
+            python main.py
+          fi
+
+      # 7) Post-sync: gom tieudedalay.csv từ nơi main.py có thể đã ghi → đưa về private-src root + src
+      - name: Post-sync tieudedalay.csv (collect & normalize)
+        run: |
+          set -e
+          ROOT_WS=./tieudedalay.csv
+          PRIV_ROOT=private-src/tieudedalay.csv
+          PRIV_SRC=private-src/src/tieudedalay.csv
+
+          # Ưu tiên file mới nhất nếu có nhiều bản
+          newest=""
+          for f in "$ROOT_WS" "$PRIV_SRC" "$PRIV_ROOT"; do
+            if [ -f "$f" ]; then
+              if [ -z "$newest" ]; then
+                newest="$f"
+              else
+                # so sánh mtime
+                if [ "$f" -nt "$newest" ]; then newest="$f"; fi
+              fi
+            fi
+          done
+
+          if [ -n "$newest" ]; then
+            echo "[INFO] Normalize from newest: $newest"
+            cp "$newest" "$ROOT_WS"   || true
+            cp "$newest" "$PRIV_ROOT" || true
+            cp "$newest" "$PRIV_SRC"  || true
+          else
+            echo "[INFO] No tieudedalay.csv produced."
+          fi
+
+      # 8) Commit & push về repo riêng tư (nếu token có quyền ghi)
+      - name: Commit & push tieudedalay.csv back to PRIVATE
+        working-directory: private-src
+        env:
+          TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          REPO: ${{ secrets.PRIVATE_REPO_REPOSITORY }}
+        run: |
+          set -e
+          if [ -z "$TOKEN" ]; then
+            echo "[INFO] No PRIVATE_REPO_TOKEN → skip push."
+            exit 0
+          fi
+
+          # đảm bảo đang ở nhánh main và up-to-date
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch origin main || true
+          git checkout -B main || true
+          git pull --rebase origin main || true
+
+          # add cả 2 vị trí khả dĩ
+          git add tieudedalay.csv src/tieudedalay.csv .state/* 2>/dev/null || true
+          git diff --cached --quiet && { echo "[INFO] No changes to commit."; exit 0; }
+          git commit -m "ci(state): update tieudedalay.csv"
+          git push origin HEAD:main
